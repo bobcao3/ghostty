@@ -18,6 +18,7 @@ const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
+const kitty_gfx = @import("kitty/graphics.zig");
 const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const lib = @import("lib.zig");
@@ -80,6 +81,8 @@ pub const Handler = struct {
     /// to send commands to the terminal emulator. This is used by
     /// the kitty graphics protocol.
     apc_handler: apc.Handler = .{},
+
+    kitty_graphics: ?*const fn (*Handler, *kitty_gfx.Command) ?kitty_gfx.Response = null,
 
     /// The DCS command handler maintains state for DCS queries.
     dcs_handler: dcs.Handler = .{},
@@ -2211,11 +2214,12 @@ pub const Handler = struct {
                 } });
             },
             .kitty => |*kitty_cmd| if (comptime build_options.kitty_graphics) {
-                if (self.terminal.kittyGraphics(
-                    io,
-                    alloc,
-                    kitty_cmd,
-                )) |resp| resp: {
+                if (!terminated) return;
+                const graphics_response = if (self.kitty_graphics) |execute|
+                    execute(self, kitty_cmd)
+                else
+                    self.terminal.kittyGraphics(io, alloc, kitty_cmd);
+                if (graphics_response) |resp| resp: {
                     // Don't waste time encoding if we can't write responses
                     // anyways.
                     if (self.effects.write_pty == null) break :resp;
