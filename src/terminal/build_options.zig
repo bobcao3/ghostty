@@ -266,13 +266,9 @@ pub const Options = struct {
         }
     };
 
-    /// Whether the Kitty graphics feature is effectively enabled for
-    /// the given target. Kitty graphics requires the ability to get
-    /// timestamps and there is no way to do that on freestanding
-    /// targets, so it is always disabled there regardless of the
-    /// feature setting.
-    pub fn kittyGraphics(self: Options, target: std.Target) bool {
-        if (target.os.tag == .freestanding) return false;
+    /// Whether Kitty graphics is enabled. The image loader rejects OS-backed
+    /// transmission media on freestanding targets.
+    pub fn kittyGraphics(self: Options, _: std.Target) bool {
         return self.features.kitty_graphics;
     }
 
