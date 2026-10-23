@@ -18,6 +18,7 @@ const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
+const kitty_gfx = @import("kitty/graphics.zig");
 const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const lib = @import("lib.zig");
@@ -187,6 +188,18 @@ pub const Handler = struct {
         /// flow the other way, by calling `kitty.dnd.State` directly.
         drag_and_drop: ?*const fn (*Handler, kitty_dnd.Event) void,
 
+        /// Called for each complete Kitty graphics command (APC G) in
+        /// place of the terminal's own handling. Returns the response to
+        /// write back to the pty, or null to send none. The command and
+        /// its payload are only valid for the duration of the call.
+        ///
+        /// Use this to apply policy before a command reaches the
+        /// terminal, such as rejecting or limiting transmissions, or to
+        /// keep encoded image data for a renderer that decodes images
+        /// itself. Call `Terminal.kittyGraphics` to execute a command.
+        /// If this is null, the terminal executes every command.
+        kitty_graphics: ?*const fn (*Handler, *kitty_gfx.Command) ?kitty_gfx.Response,
+
         /// Called in response to a color scheme DSR query (CSI ? 996 n).
         /// Returns the current color scheme. Return null to silently
         /// ignore the query.
@@ -344,6 +357,7 @@ pub const Handler = struct {
             .device_attributes = null,
             .drag_and_drop = null,
             .enquiry = null,
+            .kitty_graphics = null,
             .progress_report = null,
             .program_status = null,
             .reset = null,
@@ -2293,11 +2307,11 @@ pub const Handler = struct {
                 } });
             },
             .kitty => |*kitty_cmd| if (comptime build_options.kitty_graphics) {
-                if (self.terminal.kittyGraphics(
-                    io,
-                    alloc,
-                    kitty_cmd,
-                )) |resp| resp: {
+                const response = if (self.effects.kitty_graphics) |func|
+                    func(self, kitty_cmd)
+                else
+                    self.terminal.kittyGraphics(io, alloc, kitty_cmd);
+                if (response) |resp| resp: {
                     // Don't waste time encoding if we can't write responses
                     // anyways.
                     if (self.effects.write_pty == null) break :resp;
@@ -6776,6 +6790,42 @@ test "kitty graphics via APC" {
     const storage = &t.screens.active.kitty_images;
     const img = storage.imageById(1).?;
     try testing.expectEqual(.rgb, img.format);
+}
+
+test "kitty graphics effect replaces terminal handling" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *Handler, data: []const u8) void {
+            if (written) |old| testing.allocator.free(old);
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+        fn kittyGraphics(_: *Handler, cmd: *kitty_gfx.Command) ?kitty_gfx.Response {
+            return .{
+                .id = cmd.control.identifiers().image_id,
+                .message = "EPERM: rejected",
+            };
+        }
+    };
+    S.written = null;
+    defer if (S.written) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.kitty_graphics = &S.kittyGraphics;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\");
+
+    // The effect answered instead of the terminal, which stored nothing.
+    try testing.expectEqualStrings("\x1b_Gi=1;EPERM: rejected\x1b\\", S.written.?);
+    try testing.expect(t.screens.active.kitty_images.imageById(1) == null);
 }
 
 test "kitty graphics APC cancelled or aborted is discarded" {
