@@ -369,6 +369,14 @@ pub const RenderState = struct {
     /// beginUpdate.
     pending_styles: std.ArrayList(StyleRun) = .empty,
 
+    /// Whether `imagePlacementIterator` includes images whose pixels have
+    /// not arrived. By default an image is left out until it has pixels
+    /// to draw. A renderer that decodes images itself, outside the
+    /// terminal, never gives the terminal those pixels, so it sets this
+    /// to get the placements of its images anyway. They are laid out from
+    /// the image size the program sent.
+    pending_images: bool = false,
+
     /// Internal state for Kitty graphics placeholders. Read the results
     /// with `imagePlacementIterator` instead.
     kitty: Kitty.Data = .{},
@@ -1962,12 +1970,13 @@ const Kitty = struct {
 
     /// The Kitty graphics state of a render state (`RenderState.kitty`).
     const Data = struct {
-        /// The image storage generation, the terminal size in pixels,
-        /// and the grid size when `roots` was last built. If any of
-        /// these change, `roots` is built again and every run is looked
-        /// up again. Together the pixel and grid sizes give the cell
-        /// size.
+        /// The image storage generation, `RenderState.pending_images`,
+        /// the terminal size in pixels, and the grid size when `roots`
+        /// was last built. If any of these change, `roots` is built
+        /// again and every run is looked up again. Together the pixel
+        /// and grid sizes give the cell size.
         generation: u64 = 0,
+        pending_images: bool = false,
         width_px: u32 = 0,
         height_px: u32 = 0,
         rows: size.CellCountInt = 0,
@@ -2127,6 +2136,7 @@ const Kitty = struct {
         // change in rows or columns always causes a redraw, so those are
         // only compared on redraws.
         const roots_stale = state.kitty.generation != storage.generation or
+            state.kitty.pending_images != state.pending_images or
             state.kitty.width_px != t.width_px or
             state.kitty.height_px != t.height_px or
             (redraw and (state.kitty.rows != state.rows or
@@ -2162,6 +2172,7 @@ const Kitty = struct {
         const storage = &t.screens.active.kitty_images;
         if (roots_stale) {
             state.kitty.generation = storage.generation;
+            state.kitty.pending_images = state.pending_images;
             state.kitty.width_px = t.width_px;
             state.kitty.height_px = t.height_px;
             state.kitty.rows = state.rows;
@@ -2194,6 +2205,7 @@ const Kitty = struct {
                         run,
                         cell_width,
                         cell_height,
+                        state.pending_images,
                     );
                 }
             }
@@ -2419,6 +2431,7 @@ const Kitty = struct {
                         kv.key_ptr.*,
                         kv.value_ptr,
                         .fixed,
+                        state.pending_images,
                     ) orelse continue,
                 },
 
@@ -2444,6 +2457,7 @@ const Kitty = struct {
                             kv.key_ptr.*,
                             kv.value_ptr,
                             .relative,
+                            state.pending_images,
                         ) orelse continue,
                     };
                 },
@@ -2457,18 +2471,21 @@ const Kitty = struct {
     /// Returns the `ImagePlacement` for a placement in the image storage,
     /// with everything except `x` and `y` filled in. Returns null if
     /// there is nothing to draw, such as when the image is missing, still
-    /// loading, or the terminal has no cell size in pixels.
+    /// loading (unless `pending_images`), or the terminal has no cell
+    /// size in pixels.
     fn template(
         storage: *const kitty_gfx.ImageStorage,
         t: *const Terminal,
         key: PlacementKey,
         p: *const kitty_gfx.ImageStorage.Placement,
         kind: Placement.Kind,
+        pending_images: bool,
     ) ?RenderState.ImagePlacement {
-        // Nothing to draw until the displayed pixels arrive. For an
-        // animation, those are the current frame's pixels.
+        // Nothing to draw until the displayed pixels arrive, unless the
+        // renderer gets them elsewhere. For an animation, those are the
+        // current frame's pixels.
         const image = storage.imageById(key.image_id) orelse return null;
-        if (image.renderData().isPending()) return null;
+        if (!pending_images and image.renderData().isPending()) return null;
 
         // The size is zero when the terminal has no cell size in pixels.
         // Then there is nothing to draw.
@@ -2514,6 +2531,7 @@ const Kitty = struct {
         run: *Placeholder,
         cell_width: u32,
         cell_height: u32,
+        pending_images: bool,
     ) void {
         run.state = .hidden;
         run.target = null;
@@ -2530,7 +2548,7 @@ const Kitty = struct {
         // Nothing to draw until the displayed pixels arrive, as in
         // `template`.
         const image = storage.imageById(run.image_id) orelse return;
-        if (image.renderData().isPending()) return;
+        if (!pending_images and image.renderData().isPending()) return;
 
         // Without a cell size in pixels, there is no size to draw at.
         if (cell_width == 0 or cell_height == 0) return;
@@ -4688,6 +4706,70 @@ test "placeholders: resolved virtual placements" {
             p.image_generation,
         );
     }
+    try testing.expect(it.next() == null);
+}
+
+test "pending images are included only when requested" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 50;
+    t.modes.set(.grapheme_cluster, true);
+
+    // Image 1 has no pixels yet. It has a fixed placement and a virtual
+    // one shown through two placeholder cells.
+    const s = t.screens.active;
+    const storage = &s.kitty_images;
+    _ = try storage.addPendingImage(io, alloc, s, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+        .format = .rgb,
+        .data = .{ .pending = 10 * 10 * 3 },
+    });
+    const pin = try s.pages.trackPin(s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?);
+    try storage.addPlacement(io, alloc, s, 1, 1, .{
+        .location = .{ .pin = pin },
+        .columns = 2,
+        .rows = 1,
+    });
+    try storage.addPlacement(io, alloc, s, 1, 2, .{
+        .location = .{ .virtual = {} },
+        .columns = 2,
+        .rows = 1,
+    });
+    try t.setAttribute(.{ .@"256_fg" = 1 });
+    try t.setAttribute(.{ .@"256_underline_color" = 2 });
+    s.cursorAbsolute(3, 2);
+    try t.printString("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    var it = state.imagePlacementIterator();
+    try testing.expect(it.next() == null);
+
+    // Requesting pending images finds both placements on the next update.
+    state.pending_images = true;
+    try state.update(alloc, &t);
+    it = state.imagePlacementIterator();
+    const virtual = it.next().?;
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.virtual, virtual.protocol.kitty.kind);
+    try testing.expectEqual(3, virtual.x);
+    try testing.expectEqual(2, virtual.y);
+    // The square image is centered in its two cells.
+    try testing.expectEqual(10, virtual.width);
+    try testing.expectEqual(5, virtual.offset_x);
+    const fixed = it.next().?;
+    try testing.expectEqual(RenderState.KittyPlacement.Kind.fixed, fixed.protocol.kitty.kind);
+    try testing.expectEqual(0, fixed.x);
+    try testing.expectEqual(0, fixed.y);
+    try testing.expectEqual(20, fixed.width);
     try testing.expect(it.next() == null);
 }
 
