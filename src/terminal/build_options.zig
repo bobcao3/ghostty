@@ -157,9 +157,10 @@ pub const Options = struct {
         /// renderer uses to draw placed images. Disabled sequences are
         /// still consumed and safely ignored.
         ///
-        /// This requires the ability to get timestamps from the OS, so
-        /// it is always disabled on freestanding targets (e.g.
-        /// wasm32-freestanding) regardless of this setting.
+        /// On freestanding targets (e.g. wasm32-freestanding), only the
+        /// direct transmission medium is supported. The file, temporary
+        /// file, and shared memory media need an OS and are rejected as
+        /// unsupported.
         ///
         /// C API: `ghostty_kitty_graphics_*`.
         kitty_graphics: bool = true,
@@ -267,12 +268,9 @@ pub const Options = struct {
     };
 
     /// Whether the Kitty graphics feature is effectively enabled for
-    /// the given target. Kitty graphics requires the ability to get
-    /// timestamps and there is no way to do that on freestanding
-    /// targets, so it is always disabled there regardless of the
-    /// feature setting.
-    pub fn kittyGraphics(self: Options, target: std.Target) bool {
-        if (target.os.tag == .freestanding) return false;
+    /// the given target. Every target supports it; see `Features`
+    /// for the media freestanding targets support.
+    pub fn kittyGraphics(self: Options, _: std.Target) bool {
         return self.features.kitty_graphics;
     }
 
